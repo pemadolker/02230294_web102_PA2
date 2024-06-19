@@ -1,5 +1,5 @@
 export { Hono } from 'hono';
-import { HTTPException } from 'hono/dist/exceptions';  
+import { HTTPException } from 'hono';  
 import { PrismaClient, Prisma } from '@prisma/client';
 import { sign, verify } from 'jsonwebtoken';
 import bcrypt from 'bcrypt';
