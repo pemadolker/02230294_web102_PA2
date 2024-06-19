@@ -1,122 +1,233 @@
-import { Hono } from "hono";
-import { cors } from "hono/cors";
-import { PrismaClient, Prisma } from "@prisma/client";
-import { HTTPException } from "hono/http-exception";
-import { decode, sign, verify } from "hono/jwt";
-import { jwt } from "hono/jwt";
-import type { JwtVariables } from "hono/jwt";
+export { Hono } from 'hono';
+import { HTTPException } from 'hono/dist/exceptions';  
+import { PrismaClient, Prisma } from '@prisma/client';
+import { sign, verify } from 'jsonwebtoken';
+import bcrypt from 'bcrypt';
+import axios from 'axios';
 
 type Variables = JwtVariables;
 
 const app = new Hono<{ Variables: Variables }>();
-
 const prisma = new PrismaClient();
 
-app.use("/*", cors());
+// Middleware for CORS and other headers
+app.use('/*', async (c) => {
+  c.res.setHeader('Access-Control-Allow-Origin', '*');
+  c.res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE');
+  c.res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+});
 
-app.use(
-  "/protected/*",
-  jwt({
-    secret: "mySecretKey",
-  })
-);
+// JWT Secret
+const jwtSecret = 'mySecretKey';
 
-app.get("/protected/account/balance", async (c) => {
-  const payload = c.get("jwtPayload");
-  if (!payload) {
-    throw new HTTPException(401, { message: "Unauthorized" });
+// Helper function to generate JWT token
+const generateToken = (userId: number): string => {
+  const payload = {
+    sub: userId,
+    exp: Math.floor(Date.now() / 1000) + 60 * 60, // 1 hour expiration
+  };
+  return sign(payload, jwtSecret);
+};
+
+// Rate limiter middleware
+class RateLimiter {
+  private requestCounts: Map<string, number> = new Map();
+  private readonly maxRequests: number;
+  private readonly interval: number;
+
+  constructor(maxRequests: number, interval: number) {
+    this.maxRequests = maxRequests;
+    this.interval = interval;
+
+    // Periodically clear request counts older than interval
+    setInterval(() => {
+      this.requestCounts.clear();
+    }, this.interval);
   }
-  const user = await prisma.user.findUnique({
-    where: { id: payload.sub },
-    select: { Account: { select: { balance: true, id: true } } },
-  });
 
-  return c.json({ data: user });
-});
+  middleware = async (c) => {
+    const key = c.req.ip; // Use IP address as key (can be improved for authenticated users)
 
-app.get("/:userId/account/balance", async (c) => {
-  // get user account balance from url params
-  const { userId } = c.req.param();
+    if (!this.requestCounts.has(key)) {
+      this.requestCounts.set(key, 1);
+    } else {
+      const count = this.requestCounts.get(key) + 1;
+      this.requestCounts.set(key, count);
 
-  // create a new user
-  const user = await prisma.user.findUnique({
-    where: { id: userId },
-    select: { Account: { select: { balance: true, id: true } } },
-  });
-  return c.json({ data: user });
-});
+      if (count > this.maxRequests) {
+        throw new HTTPException(429, { message: 'Too Many Requests' });
+      }
+    }
 
-app.post("/register", async (c) => {
+    await c.next();
+  };
+}
+
+const rateLimiter = new RateLimiter(100, 60000); // Allow 100 requests per minute
+app.use('/*', rateLimiter.middleware);
+
+// Register endpoint
+app.post('/register', async (c) => {
+  const body = await c.req.json();
+  const { email, password } = body;
+
+  const hashedPassword = await bcrypt.hash(password, 10); // bcrypt hashing
+
   try {
-    const body = await c.req.json();
+    const newUser = await prisma.user.create({
+      data: {
+        email,
+        hashedPassword,
+      },
+    });
+    return c.json({ message: `${newUser.email} created successfully` });
+  } catch (e) {
+    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+      return c.json({ message: 'Email already exists' }, 400);
+    } else {
+      throw new HTTPException(500, { message: 'Internal Server Error' });
+    }
+  }
+});
 
-    const bcryptHash = await Bun.password.hash(body.password, {
-      algorithm: "bcrypt",
-      cost: 4, // number between 4-31
+// Login endpoint
+app.post('/login', async (c) => {
+  const body = await c.req.json();
+  const { email, password } = body;
+
+  try {
+    const user = await prisma.user.findUnique({
+      where: { email },
+      select: { id: true, hashedPassword: true },
     });
 
-    const user = await prisma.user.create({
+    if (!user) {
+      return c.json({ message: 'User not found' }, 404);
+    }
+
+    const match = await bcrypt.compare(password, user.hashedPassword);
+
+    if (match) {
+      const token = generateToken(user.id);
+      return c.json({ message: 'Login successful', token });
+    } else {
+      throw new HTTPException(401, { message: 'Invalid credentials' });
+    }
+  } catch (error) {
+    throw new HTTPException(500, { message: 'Internal Server Error' });
+  }
+});
+
+// Fetch Pokemon Data from PokeAPI endpoint
+app.get('/pokemon/:name', async (c) => {
+  const { name } = c.req.param();
+
+  try {
+    const response = await axios.get(`https://pokeapi.co/api/v2/pokemon/${name}`);
+    return c.json({ data: response.data });
+  } catch (error) {
+    return c.json({ message: 'Pokemon not found' }, 404);
+  }
+});
+
+// Protected routes middleware for JWT authentication
+app.use('/protected/*', async (c) => {
+  const token = c.req.headers.authorization?.split(' ')[1];
+
+  if (token) {
+    try {
+      const decoded = verify(token, jwtSecret) as { sub: number };
+      c.set('jwtPayload', decoded); // Attach decoded payload to context
+    } catch (err) {
+      throw new HTTPException(401, { message: 'Unauthorized' });
+    }
+  } else {
+    throw new HTTPException(401, { message: 'Unauthorized' });
+  }
+});
+
+// Catch Pokemon endpoint (Protected)
+app.post('/protected/catch', async (c) => {
+  const payload = c.get('jwtPayload');
+  if (!payload) {
+    throw new HTTPException(401, { message: 'Unauthorized' });
+  }
+
+  const body = await c.req.json();
+  const { name } = body;
+
+  try {
+    let pokemon = await prisma.pokemon.findUnique({ where: { name } });
+
+    if (!pokemon) {
+      pokemon = await prisma.pokemon.create({ data: { name } });
+    }
+
+    const caughtPokemon = await prisma.caughtPokemon.create({
       data: {
-        email: body.email,
-        hashedPassword: bcryptHash,
-        Account: {
-          create: {
-            balance: 0,
-          },
-        },
+        userId: payload.sub,
+        pokemonId: pokemon.id,
       },
     });
 
-    return c.json({ message: `${user.email} created successfully}` });
-  } catch (e) {
-    if (e instanceof Prisma.PrismaClientKnownRequestError) {
-      // The .code property can be accessed in a type-safe manner
-      if (e.code === "P2002") {
-        console.log(
-          "There is a unique constraint violation, a new user cannot be created with this email"
-        );
-        return c.json({ message: "Email already exists" });
-      }
-    }
-  }
-});
-
-app.post("/login", async (c) => {
-  try {
-    const body = await c.req.json();
-    const user = await prisma.user.findUnique({
-      where: { email: body.email },
-      select: { id: true, hashedPassword: true, email: true },
-    });
-    console.log(user)
-    if (!user) {
-      return c.json({ message: "User not found" });
-    }
-
-    const match = await Bun.password.verify(
-      body.password,
-      user.hashedPassword,
-      "bcrypt"
-    );
-    if (match) {
-      const payload = {
-        sub: user.id,
-        exp: Math.floor(Date.now() / 1000) + 60 * 1440, // Token expires in 60 minutes
-      };
-      const secret = "mySecretKey";
-      const token = await sign(payload, secret);
-      return c.json({
-        message: "Login successful",
-        token: token,
-        email: user.email,
-        id: user.id,
-      });
-    } else {
-      throw new HTTPException(401, { message: "Invalid credentials" });
-    }
+    return c.json({ message: 'Pokemon caught', data: caughtPokemon });
   } catch (error) {
-    throw new HTTPException(401, { message: "Invalid credentials" });
+    throw new HTTPException(500, { message: 'Internal Server Error' });
   }
 });
 
-export default app;
+// Release Pokemon endpoint (Protected)
+app.delete('/protected/release/:id', async (c) => {
+  const payload = c.get('jwtPayload');
+  if (!payload) {
+    throw new HTTPException(401, { message: 'Unauthorized' });
+  }
+
+  const { id } = c.req.param();
+
+  try {
+    await prisma.caughtPokemon.deleteMany({
+      where: { id: parseInt(id), userId: payload.sub },
+    });
+
+    return c.json({ message: 'Pokemon released' });
+  } catch (error) {
+    throw new HTTPException(500, { message: 'Internal Server Error' });
+  }
+});
+
+// Get Caught Pokemon endpoint with pagination (Protected)
+app.get('/protected/caught', async (c) => {
+  const payload = c.get('jwtPayload');
+  if (!payload) {
+    throw new HTTPException(401, { message: 'Unauthorized' });
+  }
+
+  const { page = 1, perPage = 10 } = c.req.query;
+  const skip = (parseInt(page as string) - 1) * parseInt(perPage as string);
+
+  try {
+    const caughtPokemon = await prisma.caughtPokemon.findMany({
+      where: { userId: payload.sub },
+      include: { pokemon: true },
+      skip: skip,
+      take: parseInt(perPage as string),
+    });
+
+    return c.json({ data: caughtPokemon });
+  } catch (error) {
+    throw new HTTPException(500, { message: 'Internal Server Error' });
+  }
+});
+
+// Error handler middleware
+app.use((err: HTTPException, c) => {
+  const status = err.statusCode || 500;
+  const message = err.body?.message || 'Internal Server Error';
+  return c.json({ message }, status);
+});
+
+// Start the server
+app.listen(5000, () => {
+  console.log('Server is running on http://localhost:5000');
+});
